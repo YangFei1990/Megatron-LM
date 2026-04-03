@@ -270,6 +270,7 @@ def destroy_global_state():
     destroy_model_parallel()
     destroy_rerun_state_machine()
 
+from megatron.training.argument_utils import pretrain_container_from_args
 
 def print_datetime(string, override_timestamp=None):
     """Note that this call will sync across all ranks. Use override_timestamp if provided;
@@ -902,6 +903,7 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+    config = pretrain_container_from_args(args)
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import (

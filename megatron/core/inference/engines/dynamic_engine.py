@@ -112,10 +112,6 @@ DEPRECATED_ARGS = [
     "pg_collection",
 ]
 
-# Used to turn a synchronous CUDA event wait into an asynchronous yielding poll.
-# Should be set to <1% of the forward step time. A value of 0 is safe, but may be inefficient.
-CUDA_EVENT_POLL_INTERVAL_S = 1e-4
-
 
 class EngineState(Enum):
     """State machine for the inference engine."""
@@ -1044,7 +1040,6 @@ class DynamicInferenceEngine(AbstractEngine):
         request_ids: torch.Tensor,
         finished_request_ids: torch.Tensor,
         evict_request_ids: torch.Tensor,
-        step_time: float,
         sample: torch.Tensor,
         accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
@@ -1061,7 +1056,6 @@ class DynamicInferenceEngine(AbstractEngine):
             request_ids (torch.Tensor): A list of request_ids
             finished_request_ids (torch.Tensor): A list of finished request ids
             evict_request_ids (torch.Tensor): A list of evicted request ids.
-            step_time (float): The latency of the last step
             sample: Tensor: The newly generated token for each request
             accepted_tokens: Tensor: The additional accepted tokens for each request
             log_probs: (List): Log probs for each request
@@ -1252,7 +1246,6 @@ class DynamicInferenceEngine(AbstractEngine):
         return {
             "active_request_ids": active_request_ids,
             "per_request_state": per_request_state,
-            "step_time": step_time,
             "top_n_logprobs": top_n_logprobs,
             "skip_for_stop_word": skip_for_stop_word,
             "blocks_total": blocks_total,
@@ -1572,7 +1565,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_result (Optional[Dict]): The result of the step.
                 context_state (Dict): A tuple consisting of the state of the context.
                 is_decode_only, total/paused request count, active token count.
-                step_time (float): How long this step took.
         """
 
         # If suspended, no stepping.
@@ -1601,10 +1593,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
-        # Poll the CUDA event instead of blocking the event loop on synchronize().
-        while not self.step_end_event.query():
-            await asyncio.sleep(CUDA_EVENT_POLL_INTERVAL_S)
-        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
@@ -1637,10 +1625,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context_state = {**pre_step_context_state, **post_step_context_state}
 
-        return result, context_state, step_time
+        return result, context_state
 
     def _post_process_requests_immediate(
-        self, step_result: Optional[Dict], context_state: Dict, step_time: float
+        self, step_result: Optional[Dict], context_state: Dict
     ) -> Dict:
         """Run the synchronous half of bookkeeping, required for the next forward step.
 
@@ -1674,7 +1662,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_active_request_ids,
                 finished_request_ids,
                 evict_request_ids,
-                step_time,
                 sample,
                 accepted_tokens,
                 log_probs,
@@ -1687,7 +1674,6 @@ class DynamicInferenceEngine(AbstractEngine):
             snapshot = {
                 "active_request_ids": [],
                 "per_request_state": [],
-                "step_time": step_time,
                 "top_n_logprobs": None,
                 "skip_for_stop_word": frozenset(),
                 "blocks_total": None,
@@ -1702,6 +1688,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 "spec_tokens_accepted_delta": 0,
                 "spec_steps_delta": 0,
             }
+
+        # Compute step_time using CUDA events.
+        # We can guarantee the stream has synchronized becaues we have run .tolist() on tensors.
+        if step_result is not None:
+            snapshot["step_time"] = (
+                self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+            )
+        else:
+            snapshot["step_time"] = 0.0
 
         # Snapshot finished requests for the deferred bookkeeping.
         snapshot["failed_request_ids_snapshot"] = list(self.failed_request_ids)
@@ -2104,8 +2099,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
-        step_result, context_state, step_time = await self.async_forward()
-        snapshot = self._post_process_requests_immediate(step_result, context_state, step_time)
+        step_result, context_state = await self.async_forward()
+        snapshot = self._post_process_requests_immediate(step_result, context_state)
         return await self._post_process_requests_deferred(snapshot)
 
     @trace_async_exceptions
@@ -2541,8 +2536,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_start_event.record()
                             self.controller.dummy_forward()
                             self.step_end_event.record()
-                            while not self.step_end_event.query():
-                                await asyncio.sleep(CUDA_EVENT_POLL_INTERVAL_S)
+                            self.step_end_event.synchronize()
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
                     else:
